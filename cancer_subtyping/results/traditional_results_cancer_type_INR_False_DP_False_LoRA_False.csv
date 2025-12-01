@@ -1,0 +1,2 @@
+model_type,test_acc,test_f1,test_auc,best_epoch
+traditional,0.859504132231405,0.8558557604012149,0.9511683953161052,40

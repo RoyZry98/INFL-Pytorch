@@ -1,0 +1,75 @@
+cancer_type,0,site
+Adenocarcinoma,72,simulated_local_0
+Basal cell carcinoma,1,simulated_local_0
+Carcinoma,2,simulated_local_0
+Glioblastoma,6,simulated_local_0
+Lymphoma,3,simulated_local_0
+Melanoma,5,simulated_local_0
+Neuroblastoma,4,simulated_local_0
+Neuroendocrine,1,simulated_local_0
+Normal,78,simulated_local_0
+Renal cell carcinoma,9,simulated_local_0
+Sarcoma,15,simulated_local_0
+Squamous,10,simulated_local_0
+Thyroid papillary,2,simulated_local_0
+Transitional cell carcinoma,5,simulated_local_0
+Wilm's tumour,5,simulated_local_0
+Adenocarcinoma,72,simulated_local_1
+Carcinoma,2,simulated_local_1
+Glioblastoma,3,simulated_local_1
+Lymphoma,8,simulated_local_1
+Melanoma,2,simulated_local_1
+Neuroblastoma,4,simulated_local_1
+Neuroendocrine,2,simulated_local_1
+Normal,80,simulated_local_1
+Renal cell carcinoma,2,simulated_local_1
+Sarcoma,10,simulated_local_1
+Squamous,15,simulated_local_1
+Thyroid papillary,4,simulated_local_1
+Transitional cell carcinoma,5,simulated_local_1
+Wilm's tumour,8,simulated_local_1
+Adenocarcinoma,52,simulated_local_2
+Basal cell carcinoma,2,simulated_local_2
+Carcinoma,1,simulated_local_2
+Glioblastoma,5,simulated_local_2
+Lymphoma,7,simulated_local_2
+Melanoma,4,simulated_local_2
+Neuroblastoma,3,simulated_local_2
+Neuroendocrine,3,simulated_local_2
+Normal,96,simulated_local_2
+Renal cell carcinoma,4,simulated_local_2
+Sarcoma,17,simulated_local_2
+Squamous,10,simulated_local_2
+Thyroid papillary,6,simulated_local_2
+Transitional cell carcinoma,4,simulated_local_2
+Wilm's tumour,3,simulated_local_2
+Adenocarcinoma,69,simulated_local_3
+Basal cell carcinoma,2,simulated_local_3
+Carcinoma,2,simulated_local_3
+Glioblastoma,4,simulated_local_3
+Lymphoma,5,simulated_local_3
+Melanoma,5,simulated_local_3
+Neuroblastoma,4,simulated_local_3
+Neuroendocrine,4,simulated_local_3
+Normal,92,simulated_local_3
+Renal cell carcinoma,3,simulated_local_3
+Sarcoma,8,simulated_local_3
+Squamous,10,simulated_local_3
+Thyroid papillary,4,simulated_local_3
+Transitional cell carcinoma,2,simulated_local_3
+Wilm's tumour,3,simulated_local_3
+Adenocarcinoma,69,simulated_local_4
+Basal cell carcinoma,4,simulated_local_4
+Carcinoma,1,simulated_local_4
+Glioblastoma,4,simulated_local_4
+Lymphoma,5,simulated_local_4
+Melanoma,2,simulated_local_4
+Neuroblastoma,1,simulated_local_4
+Neuroendocrine,3,simulated_local_4
+Normal,98,simulated_local_4
+Renal cell carcinoma,2,simulated_local_4
+Sarcoma,12,simulated_local_4
+Squamous,10,simulated_local_4
+Thyroid papillary,3,simulated_local_4
+Transitional cell carcinoma,2,simulated_local_4
+Wilm's tumour,1,simulated_local_4
