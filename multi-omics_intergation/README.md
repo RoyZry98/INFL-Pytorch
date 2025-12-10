@@ -21,28 +21,28 @@ python setup.py install
 R package `mclust` is needed to perform clustering and make sure it installed in a R environment.  
 
 ## Tutorial
-<!-- * [`horizontal integration`](./integration_examples/horizontal) 
-* [`vertical integration`](./integration_examples/vertical) 
-* [`mosaic integration`](./integration_examples/mosaic) 
-* [`imputation `](./imputation_examples/)  -->
+```bash
+cd tutorial/{horizontal/mosaic}
+```
 
-We provided detailed tutorials on applying SpaMosaic to various integration or imputation tasks. Please refer to [https://spamosaic.readthedocs.io/en/latest/](https://spamosaic.readthedocs.io/en/latest/).
+Set the hyperparameters:
 
-## Data
-Source of public datasets:
-1. Mouse embryonic brain dataset: [`three slices`](http://www.biosino.org/node/project/detail/OEP003285) 
-2. Mouse postnatal brain dataset (rna+atac): {[`slice 1, 2`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)}, {[`slice 3`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE171943)}
-3. Mouse postnatal brain dataset (rna+h3k4me3): {[`slice 1, 2`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)}, {[`slice 3`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE165217)}
-4. Mouse postnatal brain dataset (rna+h3k27me3): {[`slice 1,2`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)}, {[`slice 3`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE165217)}
-5. Mouse postnatal brain dataset (rna+h3k27ac): [`three slices`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)
-6. Mouse embryo: {[`slice 1`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)}, {[`slice 2,3,4`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE171943)}
-7. Five-modal mouse brain dataset (rna+atac+histone): [`four slices`](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE205055)
+```python
+result = run_and_save_mm(
+    data_dir='./data/integration/Human_tonsil',
+    device='cuda:0',
+    num_rounds=50,
+    local_epochs=2,
+    learning_rate=1e-3,
+    inr=True,              # Change to True when using INFL
+    inr_hidden_size=8,
+    run_name=None,
+    seed=1234,
+)
+```
 
-We have compiled the simulation, in-house, and public datasets into h5ad files. Please refer to [zenodo](https://zenodo.org/uploads/12654113). 
+## Data Availability  
+All data used in the experiments are publicly available on [Zenodo](https://zenodo.org/records/16925549). 
 
-## Reproduce results presented in manuscript
-To reproduce SpaMosaic's results, please visit [`reproduce`](./reproduce/) folder.
-
-To reproduce compared methods' results, including [`CLUE`](https://github.com/openproblems-bio/neurips2021_multimodal_topmethods/tree/main/src/match_modality/methods/clue), [`Cobolt`](https://github.com/epurdom/cobolt), [`scMoMaT`](https://github.com/PeterZZQ/scMoMaT), [`StabMap`](https://github.com/MarioniLab/StabMap), [`MIDAS`](https://sc-midas-docs.readthedocs.io/en/latest/mosaic.html), [`TotalVI`](https://docs.scvi-tools.org/en/stable/tutorials/notebooks/multimodal/totalVI.html), [`MultiVI`](https://docs.scvi-tools.org/en/stable/tutorials/notebooks/multimodal/MultiVI_tutorial.html), [`Babel`](https://github.com/OmicsML/dance/tree/main/examples/multi_modality/predict_modality/babel.py), please visit [`https://github.com/XiHuYan/Spamosaic-notebooks`](https://github.com/XiHuYan/Spamosaic-notebooks).
 
 
