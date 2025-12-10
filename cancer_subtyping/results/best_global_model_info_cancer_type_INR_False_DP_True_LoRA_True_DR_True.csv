@@ -1,2 +1,0 @@
-iter,test_acc,test_f1,test_auc,model_path
-68,0.8099173553719008,0.7729471838918042,0.9164767056456373,/deltadisk/zhangrongyu/leo/ProCanFDL/new_model/INFL_INR_False_DP_True_LoRA_True_DR_True/cancer_type_fedavg.pt
