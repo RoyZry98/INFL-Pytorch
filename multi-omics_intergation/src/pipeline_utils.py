@@ -11,9 +11,9 @@ import scanpy as sc
 import matplotlib.pyplot as plt
 import pandas as pd
 
-from spamosaic.framework import SpaMosaic
-from spamosaic.utils import nn_approx, plot_basis, clustering, split_adata_ob, get_umap
-from spamosaic.preprocessing import RNA_preprocess, ADT_preprocess, Epigenome_preprocess
+from src.framework import SpaMosaic
+from src.utils import nn_approx, plot_basis, clustering, split_adata_ob, get_umap
+from src.preprocessing import RNA_preprocess, ADT_preprocess, Epigenome_preprocess
 
 # -----------------------------Horizontal----------------------------------- #
 # =========================

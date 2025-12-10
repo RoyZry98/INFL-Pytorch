@@ -28,7 +28,7 @@ from sklearn.decomposition import PCA
 from annoy import AnnoyIndex
 from sklearn.preprocessing import normalize
 
-import spamosaic.MNN as MNN
+import src.MNN as MNN
 
 RAD_CUTOFF = 2000
 

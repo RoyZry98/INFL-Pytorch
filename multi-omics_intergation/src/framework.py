@@ -27,11 +27,11 @@ from torch_geometric.data import HeteroData, Data
 from torch_geometric.nn import GAE
 from torch_geometric.utils import train_test_split_edges, negative_sampling
 
-from spamosaic.train_utils import set_seeds, train_model
-import spamosaic.utils as utls
-import spamosaic.build_graph as build_graph
-import spamosaic.architectures as archs
-from spamosaic.loss import CL_loss
+from src.train_utils import set_seeds, train_model
+import src.utils as utls
+import src.build_graph as build_graph
+import src.architectures as archs
+from src.loss import CL_loss
 
 # cur_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -327,7 +327,7 @@ class SpaMosaic(object):
 
     def prepare_net(self, net, inr=False, lora=False, inr_hidden_size=16):
         # config = utls.load_config(f'{cur_dir}/configs/{net}.yaml')
-        config_path = pkg_resources.resource_filename('spamosaic', f'configs/{net}.yaml')
+        config_path = pkg_resources.resource_filename('src', f'configs/{net}.yaml')
         config = utls.load_config(config_path)
 
         mod_model = {}

@@ -1,4 +1,4 @@
-import spamosaic.architectures.wlgcn
-import spamosaic.architectures.gat
-import spamosaic.architectures.hg_lgcn
-import spamosaic.architectures.hgt
+import src.architectures.wlgcn
+import src.architectures.gat
+import src.architectures.hg_lgcn
+import src.architectures.hgt

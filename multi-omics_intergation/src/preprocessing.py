@@ -14,7 +14,7 @@ import sklearn.preprocessing
 import sklearn.utils.extmath
 from harmony import harmonize
 
-from spamosaic.utils import split_adata_ob
+from src.utils import split_adata_ob
 
 class tfidfTransformer:
     def __init__(self):
