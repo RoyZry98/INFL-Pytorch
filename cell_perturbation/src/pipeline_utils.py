@@ -39,6 +39,7 @@ class FLArgs:
     batch_size: int = 32
     seed: int = 1
     out_dir_prefix: str = "INFL"
+    posi_method: str = "norman"
 
 
 # =========================
@@ -55,6 +56,7 @@ class INRLinear(nn.Module):
                  inr_layer_num=3,
                  inr_output_activation=None,
                  inr_output_bias=0.0,
+                 alpha=0.3,
                  device="cpu"):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features, bias=bias)
@@ -64,6 +66,7 @@ class INRLinear(nn.Module):
         )
         self.inr_input_dim = inr_input_dim
         self.out_features = out_features
+        self.alpha = alpha
         self.device = device
         self.register_buffer("coords", self._create_coordinates())
 
@@ -90,33 +93,36 @@ class INRLinear(nn.Module):
         pe = self._positional_encoding(coords)
         return pe
 
-    def _positional_encoding(self, coords):
-        # norman
-        coords_dim = coords.shape[-1]
-        L = int(self.inr_input_dim / 2 / coords_dim)
-        encoded = torch.zeros(*coords.shape[:-1], coords_dim * 2 * L, device=coords.device)
-        for i in range(coords_dim):
-            freqs = 2.0 ** torch.linspace(0, L - 1, L, device=coords.device)
-            for j in range(L):
-                encoded[..., i * L + j] = torch.sin(freqs[j] * coords[..., i])
-                encoded[..., i * L + j + L] = torch.cos(freqs[j] * coords[..., i])
+    def _positional_encoding(self, coords, posi_method="norman"):
 
-        # adamson
-        # L = self.inr_input_dim // 2
-        # x = coords
-        # pe = [torch.sin((2.0 ** i)* np.pi * x) for i in range(L)]
-        # pe += [torch.cos((2.0 ** i)* np.pi * x) for i in range(L)]
-        # pe = torch.cat(pe,dim=1)
-        # encoded = pe
+        if posi_method == "norman":
+            # norman
+            coords_dim = coords.shape[-1]
+            L = int(self.inr_input_dim / 2 / coords_dim)
+            encoded = torch.zeros(*coords.shape[:-1], coords_dim * 2 * L, device=coords.device)
+            for i in range(coords_dim):
+                freqs = 2.0 ** torch.linspace(0, L - 1, L, device=coords.device)
+                for j in range(L):
+                    encoded[..., i * L + j] = torch.sin(freqs[j] * coords[..., i])
+                    encoded[..., i * L + j + L] = torch.cos(freqs[j] * coords[..., i])
+        elif posi_method == "adamson":
+            # adamson
+            L = self.inr_input_dim // 2
+            x = coords
+            pe = [torch.sin((2.0 ** i)* np.pi * x) for i in range(L)]
+            pe += [torch.cos((2.0 ** i)* np.pi * x) for i in range(L)]
+            pe = torch.cat(pe,dim=1)
+            encoded = pe
+        else:
+            raise ValueError(f"Invalid method: {method}")
 
         return encoded
 
     def forward(self, x):
         # norman 0.6 adamson 0.4
-        alpha = 0.6
         feat = self.linear(x)
         delta = self.inr(self.coords).view(1, -1)
-        return alpha * feat + (1 - alpha) * delta
+        return self.alpha * feat + (1 - self.alpha) * delta
 
 
 def replace_linear_with_inr(module,
@@ -126,6 +132,7 @@ def replace_linear_with_inr(module,
                             inr_layer_num=3,
                             inr_output_activation=None,
                             inr_output_bias=0.0,
+                            alpha=0.3,
                             device="cpu"):
     for name, child in module.named_children():
         if isinstance(child, nn.Linear):
@@ -138,6 +145,7 @@ def replace_linear_with_inr(module,
                 inr_layer_num=inr_layer_num,
                 inr_output_activation=inr_output_activation,
                 inr_output_bias=inr_output_bias,
+                alpha=alpha,
                 device=device
             )
             new_layer.linear.weight.data.copy_(child.weight.data)
@@ -147,7 +155,7 @@ def replace_linear_with_inr(module,
         else:
             replace_linear_with_inr(
                 child, inr_input_dim, inr_hidden_size, inr_output_dim,
-                inr_layer_num, inr_output_activation, inr_output_bias, device
+                inr_layer_num, inr_output_activation, inr_output_bias, alpha, device
             )
 
 
@@ -358,7 +366,7 @@ def run_federated_demo(args: FLArgs):
     gears_global.pdata = pdata
 
     if args.inr:
-        replace_linear_with_inr(gears_global.model, inr_input_dim=16, inr_hidden_size=8, device=device)
+        replace_linear_with_inr(gears_global.model, inr_input_dim=16, inr_hidden_size=8, alpha=args.alpha, device=device)
 
     global_cfg = copy.deepcopy(gears_global.config)
 
@@ -406,7 +414,7 @@ def run_federated_demo(args: FLArgs):
             gears_client.model_initialize(**global_cfg)
             gears_client.pdata = pdata_client
             if args.inr:
-                replace_linear_with_inr(gears_client.model, inr_input_dim=16, inr_hidden_size=8, device=device)
+                replace_linear_with_inr(gears_client.model, inr_input_dim=16, inr_hidden_size=8, alpha=args.alpha, device=device)
 
             gears_client.model.load_state_dict(copy.deepcopy(gears_global.model.state_dict()))
 
