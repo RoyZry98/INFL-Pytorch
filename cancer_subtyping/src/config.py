@@ -116,7 +116,7 @@ TISSUE_TYPES = [
 # ============================================================================
 # Data Processing Parameters
 # ============================================================================
-META_COL_NUMS = 3  # Number of metadata columns before protein data
+META_COL_NUMS = 4  # Number of metadata columns before protein data
 QUALITY_THRESHOLD = 0.9  # Pearson correlation threshold for sample quality
 
 # ============================================================================

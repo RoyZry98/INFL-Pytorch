@@ -105,7 +105,7 @@ print(f"\nClasses with only 1 sample: {class_counts[class_counts == 1].index.tol
 # Filter out classes with less than 2 samples for stratified split
 valid_classes = class_counts[class_counts >= 2].index
 combined_selected_df_filtered = combined_selected_df[combined_selected_df[TARGET].isin(valid_classes)]
-META_COL_NUMS = 3
+META_COL_NUMS = 4
 
 # meta_vcb = pd.read_excel(
 #     "../data/sample_info/sample_metadata_path_noHek_merged_replicates_Adel_EB_2.0_no_Mucinous.xlsx",
