@@ -74,3 +74,6 @@ If you use INFL or related components in your research, please also refer to the
 ## Contributing 🤝
 - Issues and PRs are welcome! 📨  
 - Please follow conventional commit messages and create minimal reproducible examples in bug reports. 🧩
+
+## License 📄
+This project is licensed under the MIT License. See the LICENSE file for details.
