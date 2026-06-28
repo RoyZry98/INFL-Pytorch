@@ -253,9 +253,19 @@ class GEARS:
 
         if use_inr:
             if inr_kwargs is None:
-                inr_kwargs = dict(inr_input_dim=16,
-                                  inr_hidden_size=8,
-                                  device=self.device)
+                inr_kwargs = dict(
+                    coord_dim=2,
+                    coord_points=128,
+                    key_dim=16,
+                    key_hidden=8,
+                    key_strength=5.0,
+                    coord_seed=0,
+                    coord_mode='uniform',
+                    coord_constant=1.0,
+                    device=self.device,
+                    use_film=True,
+                )
+            from .pipeline_utils import replace_linear_with_inr
             replace_linear_with_inr(self.model, **inr_kwargs)
 
 
@@ -684,5 +694,4 @@ class GEARS:
 
                     print_sys('test_' + name + '_' + m + ': ' + str(subgroup_analysis[name][m]))
         print_sys('Done!')
-
 

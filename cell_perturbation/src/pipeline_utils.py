@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import DataLoader
 import matplotlib.pyplot as plt
 
@@ -40,123 +41,329 @@ class FLArgs:
     seed: int = 1
     out_dir_prefix: str = "INFL"
     posi_method: str = "norman"
+    coord_dim: int = 2
+    coord_points: int = 128
+    coord_seed: int = 0
+    coord_mode: str = "uniform"
+    coord_constant: float = 1.0
+    key_dim: int = 16
+    key_hidden: int = 8
+    key_strength: float = 5.0
+    disable_film: bool = False
 
 
 # =========================
-# INR modules
+# Keyed-INR modules
 # =========================
-class INRLinear(nn.Module):
-    def __init__(self,
-                 in_features,
-                 out_features,
-                 bias=True,
-                 inr_input_dim=16,
-                 inr_hidden_size=32,
-                 inr_output_dim=1,
-                 inr_layer_num=3,
-                 inr_output_activation=None,
-                 inr_output_bias=0.0,
-                 alpha=0.3,
-                 device="cpu"):
+def make_coordinates(
+    seed: int,
+    mode: str,
+    num_points: int,
+    coord_dim: int,
+    device: torch.device,
+    constant: float = 1.0,
+) -> torch.Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+
+    if mode == "uniform":
+        coords = torch.rand(num_points, coord_dim, generator=g) * 2.0 - 1.0
+    elif mode == "normal":
+        coords = torch.randn(num_points, coord_dim, generator=g)
+    elif mode == "ones":
+        coords = torch.ones(num_points, coord_dim)
+    elif mode == "zeros":
+        coords = torch.zeros(num_points, coord_dim)
+    elif mode == "negones":
+        coords = -torch.ones(num_points, coord_dim)
+    elif mode == "constant":
+        coords = torch.full((num_points, coord_dim), float(constant))
+    else:
+        raise ValueError(f"Unknown coordinate mode: {mode}")
+
+    return coords.to(device)
+
+
+class CoordinateKeyEncoder(nn.Module):
+    def __init__(
+        self,
+        coord_dim: int,
+        num_points: int,
+        key_dim: int,
+        coords: torch.Tensor,
+    ) -> None:
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.inr = self._build_inr(
-            inr_input_dim, inr_hidden_size, inr_output_dim, inr_layer_num,
-            inr_output_activation, inr_output_bias, device
+        if coords.shape != (num_points, coord_dim):
+            raise ValueError(
+                f"coords shape mismatch: expected {(num_points, coord_dim)}, "
+                f"got {tuple(coords.shape)}"
+            )
+
+        self.coord_dim = int(coord_dim)
+        self.num_points = int(num_points)
+        self.key_dim = int(key_dim)
+        self.register_buffer("coords", coords.detach().clone())
+        self.net = nn.Sequential(
+            nn.Linear(coord_dim, key_dim),
+            nn.SiLU(),
+            nn.Linear(key_dim, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
         )
-        self.inr_input_dim = inr_input_dim
-        self.out_features = out_features
-        self.alpha = alpha
-        self.device = device
-        self.register_buffer("coords", self._create_coordinates())
 
-    def _build_inr(self, in_dim, hid, out_dim, num_layers, act, bias_val, device):
-        layers = []
-        for i in range(num_layers - 1):
-            layers.append(nn.Linear(in_dim if i == 0 else hid, hid))
-            layers.append(nn.ReLU())
-        last = nn.Linear(hid, out_dim)
-        if bias_val:
-            torch.nn.init.normal_(last.bias, mean=bias_val)
-        layers.append(last)
-        if act == "relu":
-            layers.append(nn.ReLU())
-        elif act == "sigmoid":
-            layers.append(nn.Sigmoid())
-        elif act == "tanh":
-            layers.append(nn.Tanh())
-        return nn.Sequential(*layers).to(device)
+    def set_coordinates(self, coords: torch.Tensor) -> None:
+        if coords.shape != self.coords.shape:
+            raise ValueError(
+                f"coords shape mismatch: expected {tuple(self.coords.shape)}, "
+                f"got {tuple(coords.shape)}"
+            )
+        with torch.no_grad():
+            self.coords.copy_(coords.to(device=self.coords.device, dtype=self.coords.dtype))
 
-    def _create_coordinates(self):
-        idxs = torch.arange(self.out_features, dtype=torch.float32, device=self.device).unsqueeze(1)
-        coords = idxs / (self.out_features - 1) * 2 - 1 if self.out_features > 1 else idxs
-        pe = self._positional_encoding(coords)
-        return pe
+    def forward(self) -> torch.Tensor:
+        return self.net(self.coords).mean(dim=0)
 
-    def _positional_encoding(self, coords, posi_method="norman"):
 
-        if posi_method == "norman":
-            # norman
-            coords_dim = coords.shape[-1]
-            L = int(self.inr_input_dim / 2 / coords_dim)
-            encoded = torch.zeros(*coords.shape[:-1], coords_dim * 2 * L, device=coords.device)
-            for i in range(coords_dim):
-                freqs = 2.0 ** torch.linspace(0, L - 1, L, device=coords.device)
-                for j in range(L):
-                    encoded[..., i * L + j] = torch.sin(freqs[j] * coords[..., i])
-                    encoded[..., i * L + j + L] = torch.cos(freqs[j] * coords[..., i])
-        elif posi_method == "adamson":
-            # adamson
-            L = self.inr_input_dim // 2
-            x = coords
-            pe = [torch.sin((2.0 ** i)* np.pi * x) for i in range(L)]
-            pe += [torch.cos((2.0 ** i)* np.pi * x) for i in range(L)]
-            pe = torch.cat(pe,dim=1)
-            encoded = pe
+class KeyControlledLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        key_dim: int,
+        hidden_dim: int,
+        key_strength: float,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.key_strength = float(key_strength)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
         else:
-            raise ValueError(f"Invalid method: {method}")
+            self.register_parameter("bias", None)
 
-        return encoded
+        self.key_to_mod = nn.Sequential(
+            nn.Linear(key_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_features * 2),
+        )
+        self.reset_parameters()
+        self._init_key_mod_near_identity()
 
-    def forward(self, x):
-        # norman 0.6 adamson 0.4
-        feat = self.linear(x)
-        delta = self.inr(self.coords).view(1, -1)
-        return self.alpha * feat + (1 - self.alpha) * delta
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / np.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _init_key_mod_near_identity(self) -> None:
+        last = self.key_to_mod[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def make_effective_params(
+        self,
+        key_vec: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mod = self.key_to_mod(key_vec)
+        scale_raw, bias_raw = mod.chunk(2, dim=0)
+        scale = 1.0 + self.key_strength * torch.tanh(scale_raw)
+        effective_weight = self.weight * scale.view(self.out_features, 1)
+
+        if self.bias is None:
+            effective_bias = None
+        else:
+            bias_delta = self.key_strength * torch.tanh(bias_raw)
+            effective_bias = self.bias + bias_delta
+        return effective_weight, effective_bias
+
+    def forward(self, x: torch.Tensor, key_vec: torch.Tensor) -> torch.Tensor:
+        weight, bias = self.make_effective_params(key_vec)
+        return F.linear(x, weight, bias)
+
+    def forward_without_key(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias)
 
 
-def replace_linear_with_inr(module,
-                            inr_input_dim=16,
-                            inr_hidden_size=32,
-                            inr_output_dim=1,
-                            inr_layer_num=3,
-                            inr_output_activation=None,
-                            inr_output_bias=0.0,
-                            alpha=0.3,
-                            device="cpu"):
-    for name, child in module.named_children():
+class ActivationDependentFiLM1d(nn.Module):
+    def __init__(
+        self,
+        features: int,
+        key_dim: int,
+        hidden_dim: int,
+        key_strength: float,
+    ) -> None:
+        super().__init__()
+        self.features = int(features)
+        self.key_strength = float(key_strength)
+        self.act_proj = nn.Sequential(
+            nn.Linear(features, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
+        )
+        self.film = nn.Sequential(
+            nn.Linear(key_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, features * 2),
+        )
+        self._init_near_identity()
+
+    def _init_near_identity(self) -> None:
+        last = self.film[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, h: torch.Tensor, key_vec: torch.Tensor) -> torch.Tensor:
+        orig_shape = h.shape
+        if h.dim() > 2:
+            h = h.reshape(-1, orig_shape[-1])
+
+        batch_size = h.shape[0]
+        act_embed = self.act_proj(h)
+        key_embed = key_vec.unsqueeze(0).expand(batch_size, -1)
+        joint = torch.cat([act_embed, key_embed, act_embed * key_embed], dim=1)
+        gamma_beta = self.film(joint)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        out = h * (1.0 + self.key_strength * torch.tanh(gamma))
+        out = out + self.key_strength * torch.tanh(beta)
+        return out.reshape(orig_shape)
+
+
+class KeyedINRLinear(nn.Module):
+    def __init__(
+        self,
+        source: nn.Linear,
+        key_encoder: CoordinateKeyEncoder,
+        key_dim: int,
+        key_hidden: int,
+        key_strength: float,
+        use_film: bool = True,
+    ) -> None:
+        super().__init__()
+        object.__setattr__(self, "key_encoder", key_encoder)
+        self.linear = KeyControlledLinear(
+            source.in_features,
+            source.out_features,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+            bias=source.bias is not None,
+        )
+        self.linear.weight.data.copy_(source.weight.data)
+        if source.bias is not None:
+            self.linear.bias.data.copy_(source.bias.data)
+
+        self.film = (
+            ActivationDependentFiLM1d(
+                source.out_features,
+                key_dim=key_dim,
+                hidden_dim=key_hidden,
+                key_strength=key_strength,
+            )
+            if use_film
+            else None
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        key_vec = self.key_encoder()
+        out = self.linear(x, key_vec)
+        if self.film is not None:
+            out = self.film(out, key_vec)
+        return out
+
+    def forward_without_inr(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear.forward_without_key(x)
+
+
+def _replace_linear_modules(
+    module: nn.Module,
+    key_encoder: CoordinateKeyEncoder,
+    key_dim: int,
+    key_hidden: int,
+    key_strength: float,
+    use_film: bool,
+) -> int:
+    replaced = 0
+    for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
-            new_layer = INRLinear(
-                child.in_features, child.out_features,
-                bias=(child.bias is not None),
-                inr_input_dim=inr_input_dim,
-                inr_hidden_size=inr_hidden_size,
-                inr_output_dim=inr_output_dim,
-                inr_layer_num=inr_layer_num,
-                inr_output_activation=inr_output_activation,
-                inr_output_bias=inr_output_bias,
-                alpha=alpha,
-                device=device
+            setattr(
+                module,
+                name,
+                KeyedINRLinear(
+                    child,
+                    key_encoder=key_encoder,
+                    key_dim=key_dim,
+                    key_hidden=key_hidden,
+                    key_strength=key_strength,
+                    use_film=use_film,
+                ),
             )
-            new_layer.linear.weight.data.copy_(child.weight.data)
-            if child.bias is not None:
-                new_layer.linear.bias.data.copy_(child.bias.data)
-            setattr(module, name, new_layer)
+            replaced += 1
         else:
-            replace_linear_with_inr(
-                child, inr_input_dim, inr_hidden_size, inr_output_dim,
-                inr_layer_num, inr_output_activation, inr_output_bias, alpha, device
+            replaced += _replace_linear_modules(
+                child,
+                key_encoder=key_encoder,
+                key_dim=key_dim,
+                key_hidden=key_hidden,
+                key_strength=key_strength,
+                use_film=use_film,
             )
+    return replaced
+
+
+def replace_linear_with_inr(
+    module: nn.Module,
+    coord_dim: int = 2,
+    coord_points: int = 128,
+    key_dim: int = 16,
+    key_hidden: int = 8,
+    key_strength: float = 5.0,
+    coord_seed: int = 0,
+    coord_mode: str = "uniform",
+    coord_constant: float = 1.0,
+    device: torch.device = torch.device("cpu"),
+    use_film: bool = True,
+) -> int:
+    device = torch.device(device)
+    coords = make_coordinates(
+        seed=coord_seed,
+        mode=coord_mode,
+        num_points=coord_points,
+        coord_dim=coord_dim,
+        device=device,
+        constant=coord_constant,
+    )
+    key_encoder = CoordinateKeyEncoder(coord_dim, coord_points, key_dim, coords).to(device)
+    replaced = _replace_linear_modules(
+        module,
+        key_encoder=key_encoder,
+        key_dim=key_dim,
+        key_hidden=key_hidden,
+        key_strength=key_strength,
+        use_film=use_film,
+    )
+    module.add_module("keyed_inr_key_encoder", key_encoder)
+
+    def set_coordinates(coords: torch.Tensor) -> None:
+        key_encoder.set_coordinates(coords)
+
+    module.set_coordinates = set_coordinates
+    module.to(device)
+    return replaced
+
+
+def _is_keyed_inr_param_name(name: str) -> bool:
+    return (
+        "keyed_inr_key_encoder" in name
+        or ".key_to_mod." in name
+        or ".film." in name
+        or ".act_proj." in name
+    )
 
 
 # =========================
@@ -180,10 +387,12 @@ def graphs_partition(dataset, num_users, seed=None):
 # =========================
 def fed_avg(state_dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     w_avg = copy.deepcopy(state_dicts[0])
-    for k in w_avg.keys():
-        for i in range(1, len(state_dicts)):
-            w_avg[k] += state_dicts[i][k]
-        w_avg[k] = w_avg[k] / len(state_dicts)
+    for k, value in w_avg.items():
+        if "coords" in k or not torch.is_floating_point(value):
+            w_avg[k] = value.clone()
+            continue
+        tensors = [sd[k].float() for sd in state_dicts]
+        w_avg[k] = torch.stack(tensors, dim=0).mean(dim=0).to(dtype=value.dtype)
     return w_avg
 
 
@@ -206,16 +415,16 @@ def adjust_module_prefix(state_dict, add_prefix=False):
 
 def count_inr_params(model: nn.Module) -> int:
     total = 0
-    for m in model.modules():
-        if isinstance(m, INRLinear):
-            total += sum(p.numel() for p in m.inr.parameters())
+    for name, param in model.named_parameters():
+        if _is_keyed_inr_param_name(name):
+            total += param.numel()
     return total
 
 
 def count_backbone_params(model: nn.Module) -> int:
     total = 0
     for n, p in model.named_parameters():
-        if ".inr." not in n:
+        if not _is_keyed_inr_param_name(n):
             total += p.numel()
     return total
 
@@ -366,7 +575,19 @@ def run_federated_demo(args: FLArgs):
     gears_global.pdata = pdata
 
     if args.inr:
-        replace_linear_with_inr(gears_global.model, inr_input_dim=16, inr_hidden_size=8, alpha=args.alpha, device=device)
+        replace_linear_with_inr(
+            gears_global.model,
+            coord_dim=args.coord_dim,
+            coord_points=args.coord_points,
+            key_dim=args.key_dim,
+            key_hidden=args.key_hidden,
+            key_strength=args.key_strength,
+            coord_seed=args.coord_seed,
+            coord_mode=args.coord_mode,
+            coord_constant=args.coord_constant,
+            device=device,
+            use_film=not args.disable_film,
+        )
 
     global_cfg = copy.deepcopy(gears_global.config)
 
@@ -374,7 +595,7 @@ def run_federated_demo(args: FLArgs):
     backbone_params = count_backbone_params(gears_global.model)
     total_params = sum(p.numel() for p in gears_global.model.parameters())
     ratio = inr_params / backbone_params if backbone_params > 0 else float("nan")
-    print(f"INR-MLP parameters: {inr_params}")
+    print(f"Keyed-INR parameters: {inr_params}")
     print(f"Backbone (non-INR) parameters: {backbone_params}")
     print(f"Total parameters: {total_params}")
     print(f"Ratio of INR parameters to backbone parameters: {ratio:.4f}")
@@ -414,7 +635,19 @@ def run_federated_demo(args: FLArgs):
             gears_client.model_initialize(**global_cfg)
             gears_client.pdata = pdata_client
             if args.inr:
-                replace_linear_with_inr(gears_client.model, inr_input_dim=16, inr_hidden_size=8, alpha=args.alpha, device=device)
+                replace_linear_with_inr(
+                    gears_client.model,
+                    coord_dim=args.coord_dim,
+                    coord_points=args.coord_points,
+                    key_dim=args.key_dim,
+                    key_hidden=args.key_hidden,
+                    key_strength=args.key_strength,
+                    coord_seed=args.coord_seed,
+                    coord_mode=args.coord_mode,
+                    coord_constant=args.coord_constant,
+                    device=device,
+                    use_film=not args.disable_film,
+                )
 
             gears_client.model.load_state_dict(copy.deepcopy(gears_global.model.state_dict()))
 

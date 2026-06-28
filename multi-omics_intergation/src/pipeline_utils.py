@@ -56,17 +56,12 @@ class FLConfig:
 
     # Algorithm Switch and Hyperparameters
     inr: bool = False
-    inr_hidden_size: int = 8
-    lora: bool = False  # If you need to pass to prepare_net, you can add parameters yourself
-    dp: bool = False
-    max_grad_norm: float = 1.0
-    noise_std: float = 0.5
-    dr: bool = False
+    inr_hidden_size: int = 16
 
     # Output Directory
     fig_dir: str = './figure'
-    emb_dir: str = './tonsil_output_embeddings'
-    log_dir: str = './tonsil_logs'
+    emb_dir: Optional[str] = None
+    log_dir: Optional[str] = None
     run_name: Optional[str] = None  # If not empty, used to name file prefix
 
 
@@ -139,13 +134,30 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def decentralized_randomization(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Randomizes the order of local model weights for decentralized randomization."""
-    models = copy.deepcopy(models)
-    for i in range(len(models) - 1):
-        j = random.randint(i, len(models) - 1)
-        models[i], models[j] = models[j], models[i]
-    return models
+def infer_dataset_prefix(data_dir: str) -> str:
+    dataset = os.path.basename(os.path.normpath(data_dir)).lower()
+    for species_prefix in ('human_', 'mouse_'):
+        if dataset.startswith(species_prefix):
+            dataset = dataset[len(species_prefix):]
+            break
+    for suffix in ('_node', '_nodes'):
+        if dataset.endswith(suffix):
+            dataset = dataset[:-len(suffix)]
+            break
+
+    cleaned = ''.join(ch if ch.isalnum() else '_' for ch in dataset).strip('_')
+    while '__' in cleaned:
+        cleaned = cleaned.replace('__', '_')
+    return cleaned or 'dataset'
+
+
+def resolve_dataset_outputs(cfg: Any) -> str:
+    dataset_prefix = infer_dataset_prefix(cfg.data_dir)
+    if cfg.emb_dir is None:
+        cfg.emb_dir = f'./{dataset_prefix}_output_embeddings'
+    if cfg.log_dir is None:
+        cfg.log_dir = f'./{dataset_prefix}_logs'
+    return dataset_prefix
 
 
 def fed_avg(weight_list: List[Dict[str, Dict[str, torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
@@ -170,8 +182,7 @@ def fed_avg(weight_list: List[Dict[str, Dict[str, torch.Tensor]]]) -> Dict[str, 
 # =========================
 def load_client_adatas(data_dir: str) -> Dict[str, sc.AnnData]:
     """
-    Load three slices according to the current human tonsil data organization structure.
-    You can also extend it to any number and path here.
+    Load three slices according to the SpaMosaic integration data layout.
     """
     ad1_rna = sc.read_h5ad(os.path.join(data_dir, 'slice1/s1_adata_rna.h5ad'))
     ad2_rna = sc.read_h5ad(os.path.join(data_dir, 'slice2/s2_adata_rna.h5ad'))
@@ -247,19 +258,10 @@ def one_client_train(client_data: List[sc.AnnData],
         local_model.mod_model[k].load_state_dict(global_weights[k])
 
     # Train
-    if cfg.dp:
-        local_model.train(net=copy.deepcopy(local_model.mod_model),
-                          lr=cfg.learning_rate,
-                          n_epochs=cfg.local_epochs,
-                          w_rec_g=0.,
-                          dp=True,
-                          max_grad_norm=cfg.max_grad_norm,
-                          noise_std=cfg.noise_std)
-    else:
-        local_model.train(net=copy.deepcopy(local_model.mod_model),
-                          lr=cfg.learning_rate,
-                          n_epochs=cfg.local_epochs,
-                          w_rec_g=0.)
+    local_model.train(net=copy.deepcopy(local_model.mod_model),
+                      lr=cfg.learning_rate,
+                      n_epochs=cfg.local_epochs,
+                      w_rec_g=0.)
 
     trained_weights = {k: copy.deepcopy(local_model.mod_model[k].state_dict())
                        for k in local_model.mod_list}
@@ -295,6 +297,7 @@ def run_federated_spamosaic(cfg: FLConfig) -> Dict[str, Any]:
       - config (dict)
     """
     set_seed(cfg.seed)
+    dataset_prefix = resolve_dataset_outputs(cfg)
     ensure_dir(cfg.fig_dir)
     ensure_dir(cfg.emb_dir)
     ensure_dir(cfg.log_dir)
@@ -344,11 +347,6 @@ def run_federated_spamosaic(cfg: FLConfig) -> Dict[str, Any]:
             local_weights.append(trained_w)
             local_losses.append(last_loss)
 
-        # Decentralized randomization (optional)
-        if cfg.dr:
-            print("Applying Decentralized Randomization to local models...")
-            local_weights = decentralized_randomization(local_weights)
-
         # Aggregate
         global_weights = fed_avg(local_weights)
 
@@ -367,7 +365,7 @@ def run_federated_spamosaic(cfg: FLConfig) -> Dict[str, Any]:
             print(f"New best model found with loss: {best_loss:.6f}")
 
     # 5) Save training curve
-    run_name = cfg.run_name or f"inr_{cfg.inr}_dp_{cfg.dp}_lora_{cfg.lora}_dr_{cfg.dr}"
+    run_name = cfg.run_name or f"inr_{cfg.inr}"
     loss_curve_path = os.path.join(cfg.fig_dir, f"fed_loss_curve_{run_name}.png")
     plt.figure()
     plt.plot(range(1, len(loss_history) + 1), loss_history)
@@ -389,13 +387,13 @@ def run_federated_spamosaic(cfg: FLConfig) -> Dict[str, Any]:
                                      final_latent_key='merged_emb')
     ad_mosaic = sc.concat(ad_embs)
 
-    emb_path = os.path.join(cfg.emb_dir, f"tonsil_merged_embeddings_{run_name}.h5ad")
+    emb_path = os.path.join(cfg.emb_dir, f"{dataset_prefix}_merged_embeddings_{run_name}.h5ad")
     ensure_dir(os.path.dirname(emb_path))
     ad_mosaic.write_h5ad(emb_path)
     print(f"Saved merged embeddings to {emb_path}")
 
     # 7) Save training log
-    loss_csv_path = os.path.join(cfg.log_dir, f"tonsil_loss_history_{run_name}.csv")
+    loss_csv_path = os.path.join(cfg.log_dir, f"{dataset_prefix}_loss_history_{run_name}.csv")
     ensure_dir(os.path.dirname(loss_csv_path))
     loss_history_df = pd.DataFrame({'round': list(range(1, len(loss_history) + 1)), 'loss': loss_history})
     loss_history_df.to_csv(loss_csv_path, index=False)
@@ -422,12 +420,9 @@ def run_and_save(
     local_epochs: int = 2,
     learning_rate: float = 1e-3,
     inr: bool = False,
-    inr_hidden_size: int = 8,
-    dp: bool = False,
-    max_grad_norm: float = 1.0,
-    noise_std: float = 0.5,
-    dr: bool = False,
-    lora: bool = False,
+    inr_hidden_size: int = 16,
+    emb_dir: Optional[str] = None,
+    log_dir: Optional[str] = None,
     run_name: Optional[str] = None,
     seed: int = 1234,
 ) -> Dict[str, Any]:
@@ -439,11 +434,8 @@ def run_and_save(
         learning_rate=learning_rate,
         inr=inr,
         inr_hidden_size=inr_hidden_size,
-        dp=dp,
-        max_grad_norm=max_grad_norm,
-        noise_std=noise_std,
-        dr=dr,
-        lora=lora,
+        emb_dir=emb_dir,
+        log_dir=log_dir,
         run_name=run_name,
         seed=seed,
     )
@@ -538,17 +530,12 @@ class FLConfigMM:
 
     # Algorithm switch
     inr: bool = False
-    inr_hidden_size: int = 8
-    lora: bool = False
-    dp: bool = False
-    max_grad_norm: float = 1.0
-    noise_std: float = 0.5
-    dr: bool = False
+    inr_hidden_size: int = 16
 
     # Output
     fig_dir: str = './figure'
-    emb_dir: str = './tonsil_output_embeddings'
-    log_dir: str = './tonsil_logs'
+    emb_dir: Optional[str] = None
+    log_dir: Optional[str] = None
     run_name: Optional[str] = None  # File name suffix; if empty, generate by switch combination
 
 
@@ -644,7 +631,7 @@ def get_clients_mm(ad_rna: Dict[str, sc.AnnData], ad_adt: Dict[str, sc.AnnData])
 
 
 # =========================
-# Federated averaging and randomization
+# Federated averaging
 # =========================
 def fed_avg_mm(weight_list: List[Dict[str, Dict[str, torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
     assert len(weight_list) > 0, "No local weights to aggregate."
@@ -656,19 +643,12 @@ def fed_avg_mm(weight_list: List[Dict[str, Dict[str, torch.Tensor]]]) -> Dict[st
             w_avg[module_name][param_name] = torch.div(w_avg[module_name][param_name], len(weight_list))
     return w_avg
 
-def decentralized_randomization_mm(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    models = copy.deepcopy(models)
-    for i in range(len(models) - 1):
-        j = random.randint(i, len(models) - 1)
-        models[i], models[j] = models[j], models[i]
-    return models
-
-
 # =========================
 # Multi-omics federated training main流程
 # =========================
 def run_federated_spamosaic_mm(cfg: FLConfigMM) -> Dict[str, Any]:
     set_seed(cfg.seed)
+    resolve_dataset_outputs(cfg)
     ensure_dir(cfg.fig_dir)
     ensure_dir(cfg.emb_dir)
     ensure_dir(cfg.log_dir)
@@ -709,15 +689,9 @@ def run_federated_spamosaic_mm(cfg: FLConfigMM) -> Dict[str, Any]:
                 local_model.mod_model[k].load_state_dict(global_weights[k])
 
             # Train (keep consistent with your script: use local_model.loss as the last loss)
-            if cfg.dp:
-                local_model.train(net=copy.deepcopy(local_model.mod_model),
-                                  lr=cfg.learning_rate, T=0.01,
-                                  n_epochs=cfg.local_epochs, w_rec_g=0.,
-                                  dp=True, max_grad_norm=cfg.max_grad_norm, noise_std=cfg.noise_std)
-            else:
-                local_model.train(net=copy.deepcopy(local_model.mod_model),
-                                  lr=cfg.learning_rate, T=0.01,
-                                  n_epochs=cfg.local_epochs, w_rec_g=0.)
+            local_model.train(net=copy.deepcopy(local_model.mod_model),
+                              lr=cfg.learning_rate, T=0.01,
+                              n_epochs=cfg.local_epochs, w_rec_g=0.)
 
             local_weights.append({k: copy.deepcopy(local_model.mod_model[k].state_dict())
                                   for k in local_model.mod_list})
@@ -725,10 +699,6 @@ def run_federated_spamosaic_mm(cfg: FLConfigMM) -> Dict[str, Any]:
             last_loss = float(local_model.loss) if hasattr(local_model, 'loss') else \
                         (float(local_model.loss_rec[-1]) if hasattr(local_model, 'loss_rec') and len(local_model.loss_rec) > 0 else np.nan)
             local_losses.append(last_loss)
-
-        if cfg.dr:
-            print("Applying Decentralized Randomization to local models...")
-            local_weights = decentralized_randomization_mm(local_weights)
 
         global_weights = fed_avg_mm(local_weights)
 
@@ -745,7 +715,7 @@ def run_federated_spamosaic_mm(cfg: FLConfigMM) -> Dict[str, Any]:
             print(f"New best model found with loss: {best_loss}")
 
     # 4) Save curve
-    run_name = cfg.run_name or f"inr_{cfg.inr}_dp_{cfg.dp}_lora_{cfg.lora}_dr_{cfg.dr}"
+    run_name = cfg.run_name or f"inr_{cfg.inr}"
     loss_curve_path = os.path.join(cfg.fig_dir, f"fed_loss_curve_{run_name}.png")
     plt.figure()
     plt.plot(range(1, len(loss_history) + 1), loss_history)
@@ -806,12 +776,9 @@ def run_and_save_mm(
     local_epochs: int = 2,
     learning_rate: float = 1e-3,
     inr: bool = False,
-    inr_hidden_size: int = 8,
-    dp: bool = False,
-    max_grad_norm: float = 1.0,
-    noise_std: float = 0.5,
-    dr: bool = False,
-    lora: bool = False,
+    inr_hidden_size: int = 16,
+    emb_dir: Optional[str] = None,
+    log_dir: Optional[str] = None,
     run_name: Optional[str] = None,
     seed: int = 1234,
 ) -> Dict[str, Any]:
@@ -823,11 +790,8 @@ def run_and_save_mm(
         learning_rate=learning_rate,
         inr=inr,
         inr_hidden_size=inr_hidden_size,
-        dp=dp,
-        max_grad_norm=max_grad_norm,
-        noise_std=noise_std,
-        dr=dr,
-        lora=lora,
+        emb_dir=emb_dir,
+        log_dir=log_dir,
         run_name=run_name,
         seed=seed,
     )

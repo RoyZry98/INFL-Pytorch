@@ -1,6 +1,6 @@
 # Implicit Neural Federated Learning for Privacy-Preserved Biological Analysis ✨🧬🔐
 
-Code and data to reproduce the **INFL** on three **Cancer Subtyping**, **Cell Perturbation**, and **Multi-Omics Integration** benchmarking results in our manuscript.
+Code and data to reproduce the **INFL** on four **Cancer Subtyping**, **Cell Perturbation**, **Multi-Omics Integration**, and **Spatial Transcriptomics** benchmarking results in our manuscript.
 
 ---
 
@@ -25,6 +25,9 @@ INFL is a lightweight federated learning framework based on Implicit Neural Repr
 - `multi-omics_integration/`
   - `src/`: Source code required for multi-omics integration using INFL.
   - `tutorial/`: Jupyter notebooks for a quick start guide and biological analysis of multi-omics integration with INFL.
+- `spatial_transcriptomics/`
+  - `src/`: Source code required for spatial transcriptomics using INFL and keyed-INR privacy analysis.
+  - `tutorial/`: Jupyter notebooks for training, visualization, and gradient inversion analysis.
 
 ---
 
@@ -44,7 +47,7 @@ INFL is a lightweight federated learning framework based on Implicit Neural Repr
 ## Resources 📦
 
 ### Data Availability 🗂️  
-The dataset used in our cell perturbation experiments is publicly available on [figshare](https://doi.org/10.6084/m9.figshare.30763670).  
+The in-house dataset used in our cell perturbation experiments is publicly available on [figshare](https://doi.org/10.6084/m9.figshare.30763670).
 
 - Contents: HUVEC scRNA-seq, YWHAB/YWHAE/YWHAH knockdowns (Sh-B/Sh-E/Sh-H) and control (SCR) 🧬  
 - License: CC BY 4.0 ✅
@@ -68,6 +71,7 @@ If you use INFL or related components in your research, please also refer to the
 - ProCanFDL (Cancer proteomics, federated DL) — “Federated Deep Learning Enables Cancer Subtyping by Proteomics” (Cancer Discovery, 2025) 🧬  
 - GEARS (Gene perturbation modeling) — “Predicting transcriptional outcomes of novel multigene perturbations with GEARS” (Nature Biotechnology, 2023) 🧪  
 - SpaMosaic (Spatial multi-omics integration) — Spatial integration with contrastive learning + GNNs 🗺️
+- PPML-Omics (Privacy-preserving federated omics learning) — “PPML-Omics: a Privacy-Preserving federated Machine Learning method protects patients’ privacy from omic data” 🛡️
 
 ---
 
@@ -77,3 +81,5 @@ If you use INFL or related components in your research, please also refer to the
 
 ## License 📄
 This project is licensed under the MIT License. See the LICENSE file for details.
+
+Made with ❤️ for privacy-preserving bioinformatics. 🧪🔐🌍

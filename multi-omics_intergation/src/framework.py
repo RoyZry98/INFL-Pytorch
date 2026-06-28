@@ -6,7 +6,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import scanpy as sc
-import math
 from tqdm import tqdm
 import scipy.sparse as sps
 import warnings
@@ -35,137 +34,256 @@ from src.loss import CL_loss
 
 # cur_dir = os.path.dirname(os.path.abspath(__file__))
 
-class LoRALinear(nn.Module):
-    def __init__(self, 
-                 in_features, 
-                 out_features, 
-                 r=4,  # LoRA rank
-                 alpha=1.0,  # Scaling factor
-                 bias=True, 
-                 device='cpu'):
+def make_coordinates(
+        seed,
+        mode,
+        num_points,
+        coord_dim,
+        device,
+        constant=1.0):
+    g = torch.Generator(device='cpu')
+    g.manual_seed(int(seed))
+
+    if mode == 'uniform':
+        coords = torch.rand(num_points, coord_dim, generator=g) * 2.0 - 1.0
+    elif mode == 'normal':
+        coords = torch.randn(num_points, coord_dim, generator=g)
+    elif mode == 'ones':
+        coords = torch.ones(num_points, coord_dim)
+    elif mode == 'zeros':
+        coords = torch.zeros(num_points, coord_dim)
+    elif mode == 'negones':
+        coords = -torch.ones(num_points, coord_dim)
+    elif mode == 'constant':
+        coords = torch.full((num_points, coord_dim), float(constant))
+    else:
+        raise ValueError(f'Unknown coordinate mode: {mode}')
+
+    return coords.to(device)
+
+
+class CoordinateKeyEncoder(nn.Module):
+    def __init__(self, coord_dim, num_points, key_dim, coords):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.r = r
-        self.alpha = alpha
 
-        # Original linear layer
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-
-        # LoRA components: low-rank matrices
-        self.lora_A = nn.Parameter(torch.zeros(r, in_features, device=device))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, r, device=device))
-
-        # LoRA scaling: alpha/r
-        self.scaling = alpha / r
-
-        # Initialize LoRA weights
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-    def forward(self, x):
-        # Original linear transformation
-        output = self.linear(x)
-
-        # LoRA adjustment
-        lora_adjustment = torch.matmul(self.lora_B, self.lora_A)  # Low-rank weight adjustment
-        lora_adjustment = torch.matmul(x, lora_adjustment.T)  # Apply to input
-
-        # Scale and add LoRA adjustment to output
-        return output + self.scaling * lora_adjustment
-
-
-def replace_linear_with_lora(module, 
-                             r=4, 
-                             alpha=1.0, 
-                             device='cpu'):
-    """
-    Replace all nn.Linear layers in a given module with LoRALinear layers.
-    
-    Args:
-        module (nn.Module): The neural network module to modify.
-        r (int): The rank of the LoRA low-rank matrices.
-        alpha (float): The scaling factor for LoRA adjustments.
-        device (str): The device to place the new layers on.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            # Replace nn.Linear with LoRALinear
-            new_layer = LoRALinear(
-                child.in_features, 
-                child.out_features, 
-                r=r, 
-                alpha=alpha, 
-                bias=(child.bias is not None), 
-                device=device
+        if coords.shape != (num_points, coord_dim):
+            raise ValueError(
+                f'coords shape mismatch: expected {(num_points, coord_dim)}, got {tuple(coords.shape)}'
             )
 
-            # Copy the original weights and bias
-            new_layer.linear.weight.data.copy_(child.weight.data)
-            if child.bias is not None:
-                new_layer.linear.bias.data.copy_(child.bias.data)
+        self.coord_dim = int(coord_dim)
+        self.num_points = int(num_points)
+        self.key_dim = int(key_dim)
 
-            # Replace the layer in the module
-            setattr(module, name, new_layer)
+        self.register_buffer('coords', coords.detach().clone())
+
+        self.net = nn.Sequential(
+            nn.Linear(coord_dim, key_dim),
+            nn.SiLU(),
+            nn.Linear(key_dim, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
+        )
+
+    def set_coordinates(self, coords):
+        if coords.shape != self.coords.shape:
+            raise ValueError(
+                f'coords shape mismatch: expected {tuple(self.coords.shape)}, got {tuple(coords.shape)}'
+            )
+
+        with torch.no_grad():
+            self.coords.copy_(
+                coords.to(device=self.coords.device, dtype=self.coords.dtype)
+            )
+
+    def forward(self):
+        return self.net(self.coords).mean(dim=0)
+
+
+class KeyControlledLinear(nn.Module):
+    def __init__(
+            self,
+            in_features,
+            out_features,
+            key_dim,
+            hidden_dim,
+            key_strength,
+            bias=True):
+        super().__init__()
+
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.key_strength = float(key_strength)
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_features))
         else:
-            # Recursively apply to child modules
-            replace_linear_with_lora(child, r=r, alpha=alpha, device=device)
+            self.register_parameter('bias', None)
+
+        self.key_to_mod = nn.Sequential(
+            nn.Linear(key_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_features * 2),
+        )
+
+        self.reset_parameters()
+        self._init_key_mod_near_identity()
+
+    def reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5))
+
+        if self.bias is not None:
+            bound = 1 / np.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _init_key_mod_near_identity(self):
+        last = self.key_to_mod[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def make_effective_params(self, key_vec):
+        mod = self.key_to_mod(key_vec)
+        scale_raw, bias_raw = mod.chunk(2, dim=0)
+
+        scale = 1.0 + self.key_strength * torch.tanh(scale_raw)
+        scale = scale.view(self.out_features, 1)
+
+        effective_weight = self.weight * scale
+
+        if self.bias is None:
+            effective_bias = None
+        else:
+            bias_delta = self.key_strength * torch.tanh(bias_raw)
+            effective_bias = self.bias + bias_delta
+
+        return effective_weight, effective_bias
+
+    def forward(self, x, key_vec):
+        w, b = self.make_effective_params(key_vec)
+        return F.linear(x, w, b)
+
+    def forward_without_key(self, x):
+        return F.linear(x, self.weight, self.bias)
+
+
+class ActivationDependentFiLM1d(nn.Module):
+    def __init__(self, features, key_dim, hidden_dim, key_strength):
+        super().__init__()
+
+        self.features = int(features)
+        self.key_strength = float(key_strength)
+
+        self.act_proj = nn.Sequential(
+            nn.Linear(features, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
+        )
+
+        self.film = nn.Sequential(
+            nn.Linear(key_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, features * 2),
+        )
+
+        self._init_near_identity()
+
+    def _init_near_identity(self):
+        last = self.film[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, h, key_vec):
+        batch_size = h.shape[0]
+
+        act_embed = self.act_proj(h)
+        key_embed = key_vec.unsqueeze(0).expand(batch_size, -1)
+
+        joint = torch.cat(
+            [
+                act_embed,
+                key_embed,
+                act_embed * key_embed,
+            ],
+            dim=1,
+        )
+
+        gamma_beta = self.film(joint)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+
+        return h * (1.0 + self.key_strength * gamma) + self.key_strength * beta
+
 
 class INRLinear(nn.Module):
-    def __init__(self, 
-                 in_features, 
-                 out_features, 
-                 bias=True, 
-                 inr_input_dim=16, 
-                 inr_hidden_size=32, 
+    def __init__(self,
+                 in_features,
+                 out_features,
+                 bias=True,
+                 inr_input_dim=16,
+                 inr_hidden_size=32,
                  inr_output_dim=1,
-                 inr_layer_num=3, 
-                 inr_output_activation=None, 
+                 inr_layer_num=3,
+                 inr_output_activation=None,
                  inr_output_bias=0.,
                  device='cpu'):
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.inr = self._build_inr(inr_input_dim, inr_hidden_size, inr_output_dim, inr_layer_num, inr_output_activation, inr_output_bias, device)
-        self.inr_input_dim = inr_input_dim
-        self.out_features = out_features
-        self.device = device
-        self.register_buffer('coords', self._create_coordinates())
-    
-    def _build_inr(self, in_dim, hid, out_dim, num_layers, act, bias, device):
-        layers = []
-        for i in range(num_layers-1):
-            layers.append(nn.Linear(in_dim if i==0 else hid, hid))
-            layers.append(nn.ReLU())
-        last = nn.Linear(hid, out_dim)
-        if bias:
-            torch.nn.init.normal_(last.bias, mean=bias)
-        layers.append(last)
-        if act == 'relu':
-            layers.append(nn.ReLU())
-        elif act == 'sigmoid':
-            layers.append(nn.Sigmoid())
-        elif act == 'tanh':
-            layers.append(nn.Tanh())
-        return nn.Sequential(*layers).to(device)
 
-    def _create_coordinates(self):
-        idxs = torch.arange(self.out_features, dtype=torch.float32, device=self.device).unsqueeze(1)
-        coords = idxs / (self.out_features-1) * 2 - 1 if self.out_features > 1 else idxs
-        pe = self._positional_encoding(coords)
-        return pe
+        coord_dim = 2
+        coord_points = 128
+        key_dim = int(inr_input_dim)
+        key_hidden = int(inr_hidden_size)
+        key_strength = 1.0
 
-    def _positional_encoding(self, coords):
-        L = self.inr_input_dim // 2
-        x = coords
-        pe = [torch.sin((2.0 ** i) * np.pi * x) for i in range(L)]
-        pe += [torch.cos((2.0 ** i) * np.pi * x) for i in range(L)]
-        pe = torch.cat(pe, dim=1)
-        return pe
+        coords = make_coordinates(
+            seed=0,
+            mode='uniform',
+            num_points=coord_points,
+            coord_dim=coord_dim,
+            device=torch.device(device),
+        )
+
+        self.key_encoder = CoordinateKeyEncoder(
+            coord_dim=coord_dim,
+            num_points=coord_points,
+            key_dim=key_dim,
+            coords=coords,
+        )
+        self.linear = KeyControlledLinear(
+            in_features,
+            out_features,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+            bias=bias,
+        )
+        self.film = ActivationDependentFiLM1d(
+            out_features,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+
+    @property
+    def coords(self):
+        return self.key_encoder.coords
+
+    def set_coordinates(self, coords):
+        self.key_encoder.set_coordinates(coords)
 
     def forward(self, x):
-        feat = self.linear(x)
-        delta = self.inr(self.coords).view(1, -1)
-        return feat + delta
+        key_vec = self.key_encoder()
+        feat = self.linear(x, key_vec)
+        return self.film(feat, key_vec)
+
+    def forward_without_inr(self, x):
+        return self.linear.forward_without_key(x)
 
 def replace_linear_with_inr(module, 
                            inr_input_dim=16, 
@@ -188,7 +306,6 @@ def replace_linear_with_inr(module,
                 inr_output_bias=inr_output_bias,
                 device=device
             )
-            # 拷贝原始权重和bias
             new_layer.linear.weight.data.copy_(child.weight.data)
             if child.bias is not None:
                 new_layer.linear.bias.data.copy_(child.bias.data)
@@ -325,7 +442,7 @@ class SpaMosaic(object):
 
         self.mod_graphs = mod_graphs
 
-    def prepare_net(self, net, inr=False, lora=False, inr_hidden_size=16):
+    def prepare_net(self, net, inr=False, inr_hidden_size=16):
         # config = utls.load_config(f'{cur_dir}/configs/{net}.yaml')
         config_path = pkg_resources.resource_filename('src', f'configs/{net}.yaml')
         config = utls.load_config(config_path)
@@ -336,8 +453,6 @@ class SpaMosaic(object):
                                         hidden_size=config.model.hid_dim, dropout=config.model.dropout, slope=config.model.slope)
             if inr:
                 replace_linear_with_inr(encoder, inr_input_dim=16, inr_hidden_size=inr_hidden_size, inr_output_dim=1, inr_layer_num=3, inr_output_activation=None, inr_output_bias=0., device=self.device)
-            if lora:
-                replace_linear_with_lora(encoder, r=4, alpha=1.0, device=self.device)
             mod_model[k] = encoder.to(self.device)
 
         return mod_model
@@ -449,4 +564,3 @@ class SpaMosaic(object):
                 imputed_batchDict[k_q][bi] = imp
 
         return imputed_batchDict
-

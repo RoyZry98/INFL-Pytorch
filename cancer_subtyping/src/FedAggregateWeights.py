@@ -35,7 +35,9 @@ class WeightsAggregation:
             for key in self.global_weights.keys():
                 # Only average parameters that are float tensors (weights and biases)
                 # Skip integer tensors (like buffer indices, counts, etc.)
-                if self.global_weights[key].dtype.is_floating_point:
+                if "coords" in key:
+                    self.global_weights[key] = models_to_use[0][key].clone()
+                elif self.global_weights[key].dtype.is_floating_point:
                     self.global_weights[key] += model_weights[key] / num_models
                 else:
                     # For non-floating point tensors, just copy the first model's values
@@ -53,7 +55,9 @@ class WeightsAggregation:
             for key in self.global_weights.keys():
                 # Only apply FedProx to parameters that are float tensors (weights and biases)
                 # Skip integer tensors (like buffer indices, counts, etc.)
-                if self.global_weights[key].dtype.is_floating_point:
+                if "coords" in key:
+                    self.global_weights[key] = models_to_use[0][key].clone()
+                elif self.global_weights[key].dtype.is_floating_point:
                     # FedProx: Incorporating the proximal term
                     fed_prox_update = model_weights[key] + self.mu * (model_weights[key] - self.global_model[key])
                     self.global_weights[key] += fed_prox_update / num_models

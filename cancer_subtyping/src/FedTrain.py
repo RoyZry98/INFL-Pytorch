@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from sklearn.metrics import f1_score, roc_auc_score, accuracy_score
 import numpy as np
 import warnings
 import math
+from typing import Optional, Tuple
 from FedModel import FedProtNet, FedProtNet_DP
 try:
     from opacus import PrivacyEngine
@@ -91,110 +93,412 @@ def replace_linear_with_lora(module,
             # Recursively apply to child modules
             replace_linear_with_lora(child, r=r, alpha=alpha, device=device)
 
-class INRLinear(nn.Module):
-    def __init__(self, 
-                 in_features, 
-                 out_features, 
-                 bias=True, 
-                 inr_input_dim=16, 
-                 inr_hidden_size=32, 
-                 inr_output_dim=1,
-                 inr_layer_num=3, 
-                 inr_output_activation=None, 
-                 inr_output_bias=0.,
-                 device='cpu'):
+def make_coordinates(
+    seed: int,
+    mode: str,
+    num_points: int,
+    coord_dim: int,
+    device: torch.device,
+    constant: float = 1.0,
+) -> torch.Tensor:
+    g = torch.Generator(device="cpu")
+    g.manual_seed(int(seed))
+
+    if mode == "uniform":
+        coords = torch.rand(num_points, coord_dim, generator=g) * 2.0 - 1.0
+    elif mode == "normal":
+        coords = torch.randn(num_points, coord_dim, generator=g)
+    elif mode == "ones":
+        coords = torch.ones(num_points, coord_dim)
+    elif mode == "zeros":
+        coords = torch.zeros(num_points, coord_dim)
+    elif mode == "negones":
+        coords = -torch.ones(num_points, coord_dim)
+    elif mode == "constant":
+        coords = torch.full((num_points, coord_dim), float(constant))
+    else:
+        raise ValueError(f"Unknown coordinate mode: {mode}")
+
+    return coords.to(device)
+
+
+class CoordinateKeyEncoder(nn.Module):
+    def __init__(
+        self,
+        coord_dim: int,
+        num_points: int,
+        key_dim: int,
+        coords: torch.Tensor,
+    ) -> None:
         super().__init__()
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.inr = self._build_inr(inr_input_dim, inr_hidden_size, inr_output_dim, inr_layer_num, inr_output_activation, inr_output_bias, device)
-        self.inr_input_dim = inr_input_dim
-        self.out_features = out_features
-        self.device = device
-        # Create coordinates and register as buffer on the correct device
-        coords = self._create_coordinates()
-        self.register_buffer('coords', coords.to(device))
-        
-        # Move the entire module to the specified device
-        self.to(device)
-    
-    def _build_inr(self, in_dim, hid, out_dim, num_layers, act, bias, device):
-        layers = []
-        for i in range(num_layers - 1):
-            layers.append(nn.Linear(in_dim if i == 0 else hid, hid))
-            layers.append(nn.ReLU())
-        last = nn.Linear(hid, out_dim)
+        if coords.shape != (num_points, coord_dim):
+            raise ValueError(
+                f"coords shape mismatch: expected {(num_points, coord_dim)}, "
+                f"got {tuple(coords.shape)}"
+            )
+
+        self.coord_dim = int(coord_dim)
+        self.num_points = int(num_points)
+        self.key_dim = int(key_dim)
+        self.register_buffer("coords", coords.detach().clone())
+        self.net = nn.Sequential(
+            nn.Linear(coord_dim, key_dim),
+            nn.SiLU(),
+            nn.Linear(key_dim, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
+        )
+
+    def set_coordinates(self, coords: torch.Tensor) -> None:
+        if coords.shape != self.coords.shape:
+            raise ValueError(
+                f"coords shape mismatch: expected {tuple(self.coords.shape)}, "
+                f"got {tuple(coords.shape)}"
+            )
+        with torch.no_grad():
+            self.coords.copy_(coords.to(device=self.coords.device, dtype=self.coords.dtype))
+
+    def forward(self) -> torch.Tensor:
+        return self.net(self.coords).mean(dim=0)
+
+
+class KeyControlledLinear(nn.Module):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        key_dim: int,
+        hidden_dim: int,
+        key_strength: float,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self.key_strength = float(key_strength)
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
         if bias:
-            torch.nn.init.normal_(last.bias, mean=bias)
-        layers.append(last)
-        if act == 'relu':
-            layers.append(nn.ReLU())
-        elif act == 'sigmoid':
-            layers.append(nn.Sigmoid())
-        elif act == 'tanh':
-            layers.append(nn.Tanh())
-        return nn.Sequential(*layers).to(device)
+            self.bias = nn.Parameter(torch.empty(out_features))
+        else:
+            self.register_parameter("bias", None)
 
-    def _create_coordinates(self):
-        idxs = torch.arange(self.out_features, dtype=torch.float32, device=self.device).unsqueeze(1)
-        coords = idxs / (self.out_features - 1) * 2 - 1 if self.out_features > 1 else idxs
-        pe = self._positional_encoding(coords)
-        return pe.to(self.device)
+        self.key_to_mod = nn.Sequential(
+            nn.Linear(key_dim, hidden_dim),
+            nn.SiLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, out_features * 2),
+        )
+        self.reset_parameters()
+        self._init_key_mod_near_identity()
 
-    def _positional_encoding(self, coords):
-        L = self.inr_input_dim // 2
-        x = coords
-        pe = [torch.sin((2.0 ** i) * np.pi * x) for i in range(L)]
-        pe += [torch.cos((2.0 ** i) * np.pi * x) for i in range(L)]
-        pe = torch.cat(pe, dim=1)
-        return pe.to(self.device)
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=np.sqrt(5))
+        if self.bias is not None:
+            bound = 1 / np.sqrt(self.in_features)
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def _init_key_mod_near_identity(self) -> None:
+        last = self.key_to_mod[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def make_effective_params(
+        self,
+        key_vec: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        mod = self.key_to_mod(key_vec)
+        scale_raw, bias_raw = mod.chunk(2, dim=0)
+        scale = 1.0 + self.key_strength * torch.tanh(scale_raw)
+        effective_weight = self.weight * scale.view(self.out_features, 1)
+
+        if self.bias is None:
+            effective_bias = None
+        else:
+            bias_delta = self.key_strength * torch.tanh(bias_raw)
+            effective_bias = self.bias + bias_delta
+        return effective_weight, effective_bias
+
+    def forward(self, x: torch.Tensor, key_vec: torch.Tensor) -> torch.Tensor:
+        weight, bias = self.make_effective_params(key_vec)
+        return F.linear(x, weight, bias)
+
+    def forward_without_key(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight, self.bias)
+
+
+class ActivationDependentFiLM1d(nn.Module):
+    def __init__(
+        self,
+        features: int,
+        key_dim: int,
+        hidden_dim: int,
+        key_strength: float,
+    ) -> None:
+        super().__init__()
+        self.features = int(features)
+        self.key_strength = float(key_strength)
+        self.act_proj = nn.Sequential(
+            nn.Linear(features, key_dim),
+            nn.SiLU(),
+            nn.LayerNorm(key_dim),
+        )
+        self.film = nn.Sequential(
+            nn.Linear(key_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, features * 2),
+        )
+        self._init_near_identity()
+
+    def _init_near_identity(self) -> None:
+        last = self.film[-1]
+        if isinstance(last, nn.Linear):
+            nn.init.normal_(last.weight, mean=0.0, std=0.02)
+            nn.init.zeros_(last.bias)
+
+    def forward(self, h: torch.Tensor, key_vec: torch.Tensor) -> torch.Tensor:
+        batch_size = h.shape[0]
+        act_embed = self.act_proj(h)
+        key_embed = key_vec.unsqueeze(0).expand(batch_size, -1)
+        joint = torch.cat([act_embed, key_embed, act_embed * key_embed], dim=1)
+        gamma_beta = self.film(joint)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = torch.tanh(gamma)
+        beta = torch.tanh(beta)
+        return h * (1.0 + self.key_strength * gamma) + self.key_strength * beta
+
+
+class FedProtNet_KeyedINR(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        num_classes,
+        dropout=0.5,
+        coord_dim=2,
+        coord_points=128,
+        key_dim=16,
+        key_hidden=8,
+        key_strength=20.0,
+        key_only_fc2_bias=False,
+        coords=None,
+        device="cpu",
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        self.dropout_rate = dropout
+        self.key_only_fc2_bias = bool(key_only_fc2_bias)
+        self.key_strength = float(key_strength)
+
+        device = torch.device(device)
+        if coords is None:
+            coords = make_coordinates(
+                seed=0,
+                mode="uniform",
+                num_points=coord_points,
+                coord_dim=coord_dim,
+                device=device,
+            )
+
+        self.key_encoder = CoordinateKeyEncoder(
+            coord_dim=coord_dim,
+            num_points=coord_points,
+            key_dim=key_dim,
+            coords=coords,
+        )
+
+        self.embedding = KeyControlledLinear(
+            input_dim,
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.embedding_film = ActivationDependentFiLM1d(
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+
+        self.rb1_linear1 = KeyControlledLinear(
+            hidden_dim,
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb1_film1 = ActivationDependentFiLM1d(
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb1_bn1 = nn.BatchNorm1d(hidden_dim)
+
+        self.rb1_linear2 = KeyControlledLinear(
+            hidden_dim,
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb1_film2 = ActivationDependentFiLM1d(
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.resblock1_bn = nn.BatchNorm1d(hidden_dim)
+
+        self.rb2_linear1 = KeyControlledLinear(
+            hidden_dim,
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb2_film1 = ActivationDependentFiLM1d(
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb2_bn1 = nn.BatchNorm1d(hidden_dim)
+
+        self.rb2_linear2 = KeyControlledLinear(
+            hidden_dim,
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.rb2_film2 = ActivationDependentFiLM1d(
+            hidden_dim,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.resblock2_bn = nn.BatchNorm1d(hidden_dim)
+
+        self.fc1 = KeyControlledLinear(
+            hidden_dim,
+            hidden_dim // 2,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+        self.fc1_film = ActivationDependentFiLM1d(
+            hidden_dim // 2,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+        )
+
+        self.fc2 = KeyControlledLinear(
+            hidden_dim // 2,
+            num_classes,
+            key_dim=key_dim,
+            hidden_dim=key_hidden,
+            key_strength=key_strength,
+            bias=not self.key_only_fc2_bias,
+        )
+
+        if self.key_only_fc2_bias:
+            self.fc2_key_bias = nn.Sequential(
+                nn.Linear(key_dim, key_hidden),
+                nn.SiLU(),
+                nn.LayerNorm(key_hidden),
+                nn.Linear(key_hidden, num_classes),
+            )
+            nn.init.zeros_(self.fc2_key_bias[-1].weight)
+            nn.init.zeros_(self.fc2_key_bias[-1].bias)
+        else:
+            self.fc2_key_bias = None
+
+        self.dropout = nn.Dropout(self.dropout_rate)
+
+    @property
+    def coords(self) -> torch.Tensor:
+        return self.key_encoder.coords
+
+    def set_coordinates(self, coords: torch.Tensor) -> None:
+        self.key_encoder.set_coordinates(coords)
 
     def forward(self, x):
-        feat = self.linear(x)
-        delta = self.inr(self.coords).view(1, -1)
-        return feat + delta
+        key_vec = self.key_encoder()
+
+        x = self.embedding(x, key_vec)
+        x = self.embedding_film(x, key_vec)
+
+        residual = x
+        x = self.rb1_linear1(x, key_vec)
+        x = self.rb1_film1(x, key_vec)
+        x = self.rb1_bn1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.rb1_linear2(x, key_vec)
+        x = self.rb1_film2(x, key_vec)
+        x = self.resblock1_bn(x + residual)
+
+        residual = x
+        x = self.rb2_linear1(x, key_vec)
+        x = self.rb2_film1(x, key_vec)
+        x = self.rb2_bn1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.rb2_linear2(x, key_vec)
+        x = self.rb2_film2(x, key_vec)
+        x = self.resblock2_bn(x + residual)
+
+        x = self.fc1(x, key_vec)
+        x = self.fc1_film(x, key_vec)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x, key_vec)
+        if self.fc2_key_bias is not None:
+            x = x + self.key_strength * torch.tanh(self.fc2_key_bias(key_vec)).unsqueeze(0)
+
+        return x
+
+    def forward_without_inr(self, x):
+        x = self.embedding.forward_without_key(x)
+
+        residual = x
+        x = self.rb1_linear1.forward_without_key(x)
+        x = self.rb1_bn1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.rb1_linear2.forward_without_key(x)
+        x = self.resblock1_bn(x + residual)
+
+        residual = x
+        x = self.rb2_linear1.forward_without_key(x)
+        x = self.rb2_bn1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.rb2_linear2.forward_without_key(x)
+        x = self.resblock2_bn(x + residual)
+
+        x = self.fc1.forward_without_key(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.fc2.forward_without_key(x)
+
+        return x
 
 
-def replace_linear_with_inr(module, 
-                           inr_input_dim=16, 
-                           inr_hidden_size=32, 
-                           inr_output_dim=1,
-                           inr_layer_num=3, 
-                           inr_output_activation=None, 
-                           inr_output_bias=0.,
-                           device='cpu'):
-    """
-    Replace all nn.Linear layers in a given module with INRLinear layers.
-    
-    Args:
-        module (nn.Module): The neural network module to modify.
-        inr_input_dim (int): Positional encoding input dimension.
-        inr_hidden_size (int): Hidden layer size for INR.
-        inr_output_dim (int): Output dimension for INR.
-        inr_layer_num (int): Number of layers in the INR network.
-        inr_output_activation (str or None): Activation function for INR output.
-        inr_output_bias (float): Bias for INR output initialization.
-        device (str): Device for the INR layers.
-    """
-    for name, child in module.named_children():
-        if isinstance(child, nn.Linear):
-            new_layer = INRLinear(
-                child.in_features, child.out_features,
-                bias=(child.bias is not None),
-                inr_input_dim=inr_input_dim,
-                inr_hidden_size=inr_hidden_size,
-                inr_output_dim=inr_output_dim,
-                inr_layer_num=inr_layer_num,
-                inr_output_activation=inr_output_activation,
-                inr_output_bias=inr_output_bias,
-                device=device
-            )
-            # Copy original weights and biases, ensuring device match
-            new_layer.linear.weight.data.copy_(child.weight.data.to(device))
-            if child.bias is not None:
-                new_layer.linear.bias.data.copy_(child.bias.data.to(device))
-            setattr(module, name, new_layer)
-        else:
-            # Recursively traverse child modules
-            replace_linear_with_inr(child, inr_input_dim, inr_hidden_size, inr_output_dim, inr_layer_num, inr_output_activation, inr_output_bias, device)
+def _is_keyed_inr_param(name: str) -> bool:
+    return (
+        "key_encoder" in name
+        or "key_to_mod" in name
+        or "film" in name
+        or "act_proj" in name
+        or "fc2_key_bias" in name
+    )
 
 
 class TrainFedProtNet:
@@ -227,26 +531,36 @@ class TrainFedProtNet:
         # Get device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Initialize model
-        self.model = FedProtNet(
-            input_dim=train_dataset.feature_dim,
-            hidden_dim=hypers["hidden_dim"],
-            num_classes=train_dataset.num_classes,
-            dropout=hypers["dropout"],
-        ).to(self.device)
-
-        # Replace linear layers with INRLinear if use_inr is True
         if self.use_inr:
-            replace_linear_with_inr(
-                self.model,
-                inr_input_dim=16,
-                inr_hidden_size=4,
-                inr_output_dim=1,
-                inr_layer_num=3,
-                inr_output_activation=None,
-                inr_output_bias=0.0,
-                device=self.device
+            coords = make_coordinates(
+                seed=0,
+                mode="uniform",
+                num_points=128,
+                coord_dim=2,
+                device=self.device,
+                constant=1.0,
             )
+            self.model = FedProtNet_KeyedINR(
+                input_dim=train_dataset.feature_dim,
+                hidden_dim=hypers["hidden_dim"],
+                num_classes=train_dataset.num_classes,
+                dropout=hypers["dropout"],
+                coord_dim=2,
+                coord_points=128,
+                key_dim=16,
+                key_hidden=8,
+                key_strength=20.0,
+                key_only_fc2_bias=False,
+                coords=coords,
+                device=self.device,
+            ).to(self.device)
+        else:
+            self.model = FedProtNet(
+                input_dim=train_dataset.feature_dim,
+                hidden_dim=hypers["hidden_dim"],
+                num_classes=train_dataset.num_classes,
+                dropout=hypers["dropout"],
+            ).to(self.device)
 
         # Load pre-trained weights if specified
         if load_model is not None:
@@ -294,9 +608,9 @@ class TrainFedProtNet:
         for name, param in self.model.named_parameters():
             total_model_params += param.numel()
             
-            if 'inr' in name:
+            if _is_keyed_inr_param(name):
                 inr_params += param.numel()
-            elif 'linear' in name and 'inr' not in name:
+            elif 'linear' in name and not _is_keyed_inr_param(name):
                 linear_params += param.numel()
             else:
                 other_params += param.numel()
@@ -320,7 +634,7 @@ class TrainFedProtNet:
         # Check specifically for INR parameters
         inr_in_optimizer = 0
         for name, param in self.model.named_parameters():
-            if 'inr' in name and id(param) in optimizer_param_ids:
+            if _is_keyed_inr_param(name) and id(param) in optimizer_param_ids:
                 inr_in_optimizer += param.numel()
         
         print(f"\nINR Parameter Check:")
@@ -948,4 +1262,3 @@ class TrainFedProtNet_DP:
                 new_state_dict[key] = value
         
         self.model.load_state_dict(new_state_dict)
-
